@@ -5,7 +5,7 @@
 _version="1.7.1"
 
 
-pipe="/tmp/p_$(date +%s)"
+pipe="/tmp/p_$(head -c 100 /dev/urandom | tr -d -c "[:alnum:]")"
 mkfifo $pipe
 trap "printf \"\nterminating...\n\"; rm $pipe" EXIT
 
@@ -19,10 +19,12 @@ currentlink=""
 tag[0]="img"
 tag[1]="src"
 follow=""
+filter=""
 result=""
 baseurl=""
 captureonly=""
 smartdownload=""
+smartcheckmd5=""
 let "START=0,STEP=1,END=10000"
 
 
@@ -32,17 +34,21 @@ function print_help {
 	echo
 	echo "Usage: $0 options"
 	echo "  -- help        this message will pop up"
-	echo "  -u <topic-url-with-$flag> or --remove-duplicates"
+	echo "  -u <topic-url-with-$flag>"
+	echo "  --remove-duplicates >"
+	echo "                       remove duplicates from current folder"
 	echo "  --rename       rename all files(in case of all captured files have same name)"
+	echo "  --filter <str> only links with str in them will process"
 	echo "  --smart-download  >"
-	echo "                 this enable smart download feature, which only a download new files(based on sizes and (if equal) partial md5sum's)"
+	echo "                     this enable smart download feature, which only a download"
+	echo "                     new files(based on sizes and (if equal) partial md5sum's)"
 	echo "  --capture-all  first capture all pages links, then proceed with links."
 	echo "                 usefull when content is update quickly"
 	echo "  --capture-only only capture and save the links to captured_links file"
 	echo "  --cookie <str> set cookie, style: PHPID=blablabla!"
 	echo "  --order  <start=0>:<step=1>:<end>"
 	echo "  --tag          html tag to proceed (default=\"img:src\")"
-	echo "  --follow       follow internal links(1 level), and then search for images"
+	echo "  --follow       follow internal links(depth=1), and then search for tags"
 	echo "  -t <translate> translate site links to desired links."
 	echo "                 for example change _small tag to _large tag and so on."
 	echo
@@ -59,22 +65,33 @@ function collect_filesinfo {
 	
 	if [ -e .smartinfo ]; then
 		for line in $(cat .smartinfo); do
-			localfilesinfo[$p]="$line"
+			localfilesize[$p]="$(echo $line | sed s/^.*:\(.*\)/\1/g)"
+			localfilename[$p]="$(echo $line | sed s/^\(.*\):.*/\1/g)"
 			let "p++"
 		done
 	else
 		for nfile in $(ls -1); do
 			if [ -f "$nfile" ]; then
-				size="$(du -b $nfile)"
+				size=$(du -b $nfile | sed "s/^\([0-9]*\).*/\1/g")
 				localfilesize[$p]="$size"
 				localfilename[$p]="$nfile"
-				echo "$nfile:$size" >> .smartinfo
+				printf "$nfile:$size\n" >> .smartinfo
 				printf "\r $p records      "
 				let "p++"
 			fi
 		done
 	fi
 	IFS=$SAVEIFS
+	
+	for size in ${!localfilesize[@]}; do
+		for csize in ${!localfilesize[@]}; do
+			if [ $size -eq $csize ]; then
+				smartcheckmd5="1"
+				echo "check md5 too"
+				break 2;
+			fi
+		done
+	done
 	
 	echo
 }
@@ -84,25 +101,24 @@ function collect_filesinfo {
 function remove_duplicate {
 	SAVEIFS=$IFS
 	IFS=$(echo -en "\n\b")
-	l=$(md5sum * | sort | sed "s/\([a-z0-9A-Z]*\)  \(.*\)/\1 \2/")
-	la=""
-	for i in $l; do
-		if [ "$la" == "$(echo "$i" | grep -o -P "^.{32}")" ]; then
-			b=$(echo "$i" | sed "s/\([a-z0-9A-Z]*\) \(.*\)/\2/")
+	md5s=$(md5sum $(ls -b1) | sort | sed "s/\([a-z0-9A-Z]*\) \(.*\)/\1 \2/")
+	prev_md5=""
+	for i in $md5s; do
+		if [ "$prev_md5" == "$(echo "$i" | grep -o -P "^.{32}")" ]; then
+			b=$(echo "$i" | sed "s/\([a-z0-9A-Z]*\)  \(.*\)/\2/")
 			echo "removing \"$b\" ..."
 			rm $b
 		fi
-		la=$(echo "$i" | grep -o -P "^.{32}")
+		prev_md5=$(echo "$i" | grep -o -P "^.{32}")
 	done
 	IFS=$SAVEIFS
 }
 
-
 # download function
 function download_function {
-	fn="`echo $currentlink | sed "s/^\(.*\)\/\(.*\)/\2/"`" # get file name
+	fn="$(echo $currentlink | sed "s/^\(.*\)\/\(.*\)/\2/")" # get file name
 	if [ -e "$fn" ]; then
-		if [ "`echo "$fn" | grep -o -P ".{3}$" | tr "[A-Z]" "[a-z]"`" == "jpg" ]; then
+		if [ "$(echo "$fn" | grep -o -P ".{3}$" | tr "[A-Z]" "[a-z]")" == "jpg" ]; then
 			if [ "$(tail -c 2 "$fn" | hexdump -v -e '/1 "%02X"')" == "FFD9" ]; then
 				result="ok"
 				return
@@ -125,20 +141,24 @@ function download_function {
 		else 
 			size=$(curl -s --cookie "$cookie" --head "$currentlink" | grep "Length:" | sed "s/.* \([0-9]*\)/\1/g")
 		fi
-		if [ "$size" != "" ] && [ $size -gt 0 ]; then
+		if [ "$size" != "" ] && [ "$size" -gt "0" ]; then
 			# check for sizes
-			for findex in "${!localfilesinfo[@]}"; do
-				if [ "${localfilesize[findex]}" == "$size" ]; then
-					# check for md5
-					rmd5=$(curl -s -r 0-1000 "$currentlink" | md5sum | grep -o -P "^[a-zA-Z0-9]*")
-					lmd5=$(head -c 1001 ${localfilename[]} | md5sum | grep -o -P ^[a-zA-Z0-9]*)
-					if [ "$rmd5" == "$lmd5" ]; then
-						result="ok"
-						ofn="[HAVE]"
-						return
-					fi
+			findex=$(echo ${localfilesize[@]} | tr " " "\n" | grep -n -x $size | tr "\n" " " | sed "s/\([0-9]*\):.*/\1/g");
+			if [ "$findex" != "" ] && [ "$findex" -gt "0" ]; then let "findex--"; fi
+			if [ "$smartcheckmd5" == "1" ] && [ "${localfilesize[$findex]}" == "$size" ]; then
+				# check for md5
+				rmd5=$(curl -s -r 0-1000 "$currentlink" | md5sum | grep -o -P "^[a-zA-Z0-9]*")
+				lmd5=$(head -c 1001 ${localfilename[$findex]} | md5sum | grep -o -P ^[a-zA-Z0-9]*)
+				if [ "$rmd5" == "$lmd5" ]; then
+					result="ok"
+					ofn="[HAVE]"
+					return
 				fi
-			done
+			elif [ "$smartcheckmd5" == "" ] && [ "${localfilesize[$findex]}" == "$size" ]; then
+				result="ok"
+				ofn="[HAVE]"
+				return
+			fi
 		fi
 	fi
 	
@@ -148,10 +168,10 @@ function download_function {
 		wget -nc -q -t 2 --timeout=15 "$currentlink"
 	fi
 	
-	if [ "`file $fn | grep -o HTML`" == "HTML" ]; then
+	if [ "$(file $fn | grep -o HTML)" == "HTML" ]; then
 		rm $fn
 		result="html"
-	elif [ "`file $fn | grep -o ERROR`" == "ERROR" ]; then
+	elif [ "$(file $fn | grep -o ERROR)" == "ERROR" ]; then
 		result="error"
 	else
 		if [ "`echo "$fn" | grep -o -P ".{3}$" | tr "[A-Z]" "[a-z]"`" == "jpg" ]; then
@@ -215,8 +235,11 @@ function follow_links {
 	
 	for page in $links; do
 		# we process only internal links
-		if [ "$(echo $page | grep -o -P '^http')" == "" ]; then
-			page="$baseurl$page";
+		if ( [ "$(echo "$page" | grep -o -P "^http")" == "" ] || [ "$(echo "$page" | grep -o -P "$baseurl")" == "$baseurl" ] ) &&
+			( [ "$filter" == "" ] || ( [ "$filter" != "" ] && [ "$(echo "$page" | grep -o -P "$filter")" == "$filter" ] ) ); then
+			if [ "${translate[@]}" != "" ]; then page=$(echo "$page" | ${translate[0]}); fi
+			if [ "$(echo $page | grep -o -P "^http")" == "" ]; then page="$baseurl$page"; fi
+			echo "$page"
 			toprocess="$toprocess $page"
 			let "npl++"
 			printf "\r Processing Links %d   " $npl
@@ -306,6 +329,9 @@ for op in $@; do
 	elif [ "${!n}" == "--smart" ]; then
 		smartdownload=1;
 	elif [ "${!n}" == "" ]; then break;
+	elif [ "${!n}" == "--filter" ]; then
+		filter="${!m}"
+		let "n++"
 	elif [ "${!n}" == "--rename" ]; then rename=1
 	elif [ "${!n}" == "--capture-only" ]; then
 		captureonly="1";
