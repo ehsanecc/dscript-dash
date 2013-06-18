@@ -2,7 +2,7 @@
 
 # CODED BY EHSAN VARASTEH [MAY 1 2013]
 
-_version="1.7.1"
+_version="1.7.3"
 
 
 pipe="/tmp/p_$(head -c 100 /dev/urandom | tr -d -c "[:alnum:]")"
@@ -11,7 +11,6 @@ trap "printf \"\nterminating...\n\"; rm $pipe" EXIT
 
 # global variables
 flag="%n%"
-ofn=""
 rename=""
 cookie=""
 capturefirst=""
@@ -21,10 +20,12 @@ tag[1]="src"
 follow=""
 filter=""
 result=""
+logfile="download.log"
 baseurl=""
 captureonly=""
 smartdownload=""
 smartcheckmd5=""
+threads="1"
 let "START=0,STEP=1,END=10000"
 
 
@@ -37,11 +38,14 @@ function print_help {
 	echo "  -u <topic-url-with-$flag>"
 	echo "  --remove-duplicates >"
 	echo "                       remove duplicates from current folder"
+	echo "  --remove-corrupts    remove corrupted files(jpg)"
 	echo "  --rename       rename all files(in case of all captured files have same name)"
 	echo "  --filter <str> only links with str in them will process"
 	echo "  --smart-download  >"
 	echo "                     this enable smart download feature, which only a download"
 	echo "                     new files(based on sizes and (if equal) partial md5sum's)"
+	echo "  --threads <int> number of threads used for downloading, don't confuse with partial"
+	echo "				   downloading, it's multi-thread downloading single files.(default=1)"
 	echo "  --capture-all  first capture all pages links, then proceed with links."
 	echo "                 usefull when content is update quickly"
 	echo "  --capture-only only capture and save the links to captured_links file"
@@ -59,39 +63,26 @@ function print_help {
 }
 
 function collect_filesinfo {
-	local p=0,size=0
-	SAVEIFS=$IFS
-	IFS=$(echo -en "\n\b")
+	local p=0 fsize
 	
-	if [ -e .smartinfo ]; then
-		for line in $(cat .smartinfo); do
-			localfilesize[$p]="$(echo $line | sed s/^.*:\(.*\)/\1/g)"
-			localfilename[$p]="$(echo $line | sed s/^\(.*\):.*/\1/g)"
-			let "p++"
-		done
-	else
-		for nfile in $(ls -1); do
-			if [ -f "$nfile" ]; then
-				size=$(du -b $nfile | sed "s/^\([0-9]*\).*/\1/g")
-				localfilesize[$p]="$size"
-				localfilename[$p]="$nfile"
-				printf "$nfile:$size\n" >> .smartinfo
+	if [ ! -e .smartinfo ]; then
+		for fname in $(ls -1); do
+			if [ -f "$fname" ]; then
+				fsize="$(du -b "$fname" | grep -o -P "^[0-9]+")"
+				echo "$fname:$fsize" >> .smartinfo
 				printf "\r $p records      "
 				let "p++"
 			fi
 		done
 	fi
-	IFS=$SAVEIFS
+	localfilesize="$(cat .smartinfo | grep -o -P [0-9]+$)"
+	localfilename="$(cat .smartinfo | grep -o -P ^[a-z0-9_.]+)"
+	echo
 	
-	for size in ${!localfilesize[@]}; do
-		for csize in ${!localfilesize[@]}; do
-			if [ $size -eq $csize ]; then
-				smartcheckmd5="1"
-				echo "check md5 too"
-				break 2;
-			fi
-		done
-	done
+	if [ "$(printf "$localfilesize" | sort -u)" != "$(printf "$localfilesize" | sort)" ]; then
+		smartcheckmd5="1"
+		echo "check md5 too"
+	fi
 	
 	echo
 }
@@ -114,21 +105,40 @@ function remove_duplicate {
 	IFS=$SAVEIFS
 }
 
+#  Remove corrupted downloads (JPEG)
+function remove_corrupts {
+	for fn in $(ls -1 *.jpg); do
+		printf "checking $fn...\r"
+		if [ "$(tail -c 2 "$fn" | hexdump -v -e '/1 "%02X"')" != "FFD9" ]; then
+			echo "$fn is corrupt                    "
+			rm "$fn"
+		fi
+	done
+}
+
 # download function
 function download_function {
-	fn="$(echo $currentlink | sed "s/^\(.*\)\/\(.*\)/\2/")" # get file name
+	local ofn="" size=0 curlink="$currentlink"
+	fn="$(echo $curlink | sed "s/^\(.*\)\/\(.*\)/\2/")" # get file name
 	if [ -e "$fn" ]; then
 		if [ "$(echo "$fn" | grep -o -P ".{3}$" | tr "[A-Z]" "[a-z]")" == "jpg" ]; then
 			if [ "$(tail -c 2 "$fn" | hexdump -v -e '/1 "%02X"')" == "FFD9" ]; then
-				result="ok"
+				echo "$curlink [skip]" >> $logfile
 				return
 			else
+				echo "$curlink [file is corrupt, redownload]" >> $logfile
 				rm $fn
 			fi
 		else
-			result="ok"
+			echo "$curlink [skip]" >> $logfile
 			return
 		fi
+	fi
+	
+	if [ "$rename" != "" ]; then
+		ofn="$(head -c 200 /dev/urandom | tr -c -d "[:alnum:]" | tr "[A-Z]" "[a-z]" | grep -o -P "^.{12}")_$fn";
+	else
+		ofn="$fn";
 	fi
 	
 	# this smart process may delay a lot! so i should try to optimize it.
@@ -137,95 +147,81 @@ function download_function {
 		# if size matches, check md5 of that file
 		#    if md5 matches, means size & md5 both matches, so we have the file
 		if [ "$cookie" == "" ]; then
-			size=$(curl -s --head "$currentlink" | grep "Length:" | sed "s/.* \([0-9]*\)/\1/g")
+			size=$(curl -s --head "$curlink" | grep "Length:" | sed "s/.* \([0-9]*\)/\1/g")
 		else 
-			size=$(curl -s --cookie "$cookie" --head "$currentlink" | grep "Length:" | sed "s/.* \([0-9]*\)/\1/g")
+			size=$(curl -s --cookie "$cookie" --head "$curlink" | grep "Length:" | sed "s/.* \([0-9]*\)/\1/g")
 		fi
 		if [ "$size" != "" ] && [ "$size" -gt "0" ]; then
 			# check for sizes
-			findex=$(echo ${localfilesize[@]} | tr " " "\n" | grep -n -x $size | tr "\n" " " | sed "s/\([0-9]*\):.*/\1/g");
-			if [ "$findex" != "" ] && [ "$findex" -gt "0" ]; then let "findex--"; fi
-			if [ "$smartcheckmd5" == "1" ] && [ "${localfilesize[$findex]}" == "$size" ]; then
+			findex=$(printf "$localfilesize" | grep -n -x $size | grep -o -P "^[0-9]+" | sed -n 1p);
+			if [ "$smartcheckmd5" == "1" ] && [ "$(printf "$localfilesize" | sed -n "$findex"p)" == "$size" ]; then
 				# check for md5
-				rmd5=$(curl -s -r 0-1000 "$currentlink" | md5sum | grep -o -P "^[a-zA-Z0-9]*")
-				lmd5=$(head -c 1001 ${localfilename[$findex]} | md5sum | grep -o -P ^[a-zA-Z0-9]*)
+				rmd5=$(curl -s -r 0-1000 "$curlink" | md5sum | grep -o -P "^[a-zA-Z0-9]*")
+				lmd5=$(head -c 1001 "$(printf "$localfilename" | sed -n "$findex"p)" | md5sum | grep -o -P ^[a-zA-Z0-9]*)
 				if [ "$rmd5" == "$lmd5" ]; then
-					result="ok"
-					ofn="[HAVE]"
+					echo "$curlink [skip]" >> $logfile
 					return
 				fi
-			elif [ "$smartcheckmd5" == "" ] && [ "${localfilesize[$findex]}" == "$size" ]; then
-				result="ok"
-				ofn="[HAVE]"
+			elif [ "$smartcheckmd5" == "" ] && [ "$(printf "$localfilesize" | sed -n "$findex"p)" == "$size" ]; then
+				echo "$curlink [skip]" >> $logfile
 				return
 			fi
 		fi
 	fi
 	
 	if [ "$cookie" != "" ]; then
-		wget --no-cookies --header "Cookie: $cookie" -nc -q -t 2 --timeout=15 "$currentlink"
+		wget --no-cookies -O "$ofn" --header "Cookie: $cookie" -nc -q -t 2 --timeout=15 "$curlink"
 	else 
-		wget -nc -q -t 2 --timeout=15 "$currentlink"
+		wget -nc -q -t 2 -O "$ofn" --timeout=15 "$curlink"
 	fi
 	
-	if [ "$(file $fn | grep -o HTML)" == "HTML" ]; then
-		rm $fn
-		result="html"
-	elif [ "$(file $fn | grep -o ERROR)" == "ERROR" ]; then
-		result="error"
+	if [ "$(file $ofn | grep -o HTML)" == "HTML" ]; then
+		rm $ofn
+		echo "$curlink [html]" >> $logfile
+		let "nhtml++"
+	elif [ "$(file $ofn | grep -o ERROR)" == "ERROR" ]; then
+		echo "$curlink [error]" >> $logfile
 	else
-		if [ "`echo "$fn" | grep -o -P ".{3}$" | tr "[A-Z]" "[a-z]"`" == "jpg" ]; then
-			if [ "`tail -c 2 "$fn" | hexdump -v -e '/1 "%02X"'`" == "FFD9" ]; then
-				result="ok"
-			else
-				rm $fn # remove corrupt file
-				result="corrupt"
+		if [ "$(echo "$ofn" | grep -o -P ".{3}$" | tr "[A-Z]" "[a-z]")" == "jpg" ]; then
+			if [ "$(tail -c 2 "$ofn" | hexdump -v -e '/1 "%02X"')" != "FFD9" ]; then
+				rm $ofn # remove corrupt file
+				echo "$curlink [corrupt]" >> $logfile
 			fi
-		else
-			result="ok"
 		fi
 	fi
 	
-	#rename outfile
-	if [ "$rename" != "" ]; then
-		ofn="$(date +%s)_$fn";
-		mv "$fn" "$ofn";
-	else
-		ofn="$fn";
+	echo "$curlink [$ofn]" >> $logfile
+	let "nok++"
+	
+	# update .smartinfo file
+	if [ "$smartdownload" == "1" ] && [ -f $ofn ]; then
+		echo "$ofn:$(du -b $ofn | grep -o -P "^[0-9]+")" >> .smartinfo
 	fi
 }
 
 function download_loop {
+	local tt=0
 	for link in $links; do
-		if [ "`echo "$link" | grep "http://"`" == "" ]; then
-			link="`echo "$url" | grep -o -P "http://[a-zA-Z.]*/"`$link"
+		if [ "$(echo "$link" | grep -o -P "(http|ftp)\:\/\/")" == "" ]; then
+			link="$baseurl$link"
 		fi
-		blink="$link" # backup link
 		
-		printf "$(date +%H:%M:%S) $num/$nlinks: %s" $link
+		printf "\r[$(date +%H:%M:%S)] $num/$nlinks: %s  " $link
 		if [ "$(echo ${translate[@]})" != "" ]; then
 			for func in ${!translate[@]}; do
 				link=$(echo "$link" | ${translate[$func]})
 				currentlink="$link"
-				download_function
-				if [ "$result" == "ok" ]; then break; fi
+				download_function &
 			done
 		else
 			currentlink="$link"
-			download_function
+			download_function &
 		fi
-		if [ "$result" == "ok" ]; then
-			echo "$link:$ofn" >> download.log
-			echo ":$ofn ok."
-			let "nok++"
-		elif [ "$result" == "html" ]; then
-			echo " html."
-			let "nhtml++"
-		elif [ "$result" == "corrupt" ]; then
-			echo "corrupt"
-		else echo "!!"
+		let "num++,tt++"
+		if [ $tt -eq $threads ]; then
+			wait
+			let tt=0
 		fi
-		let "num++"
 	done
 }
 
@@ -309,6 +305,9 @@ for op in $@; do
 		baseurl=$(echo $url | grep -o -P "^http://[a-zA-Z0-9.-]*/")
 		echo "base url is $baseurl ?"
 		let "n++";
+	elif [ "${!n}" == "--remove-corrupts" ]; then
+		remove_corrupts
+		exit
 	elif [ "${!n}" == "--order" ]; then
 		START=$(echo "${!m}" | sed "s/\([0-9]*\):[0-9]*:[0-9]*/\1/");
 		STEP=$(echo "${!m}" | sed "s/[0-9]*:\([0-9]*\):[0-9]*/\1/");
@@ -331,6 +330,9 @@ for op in $@; do
 	elif [ "${!n}" == "" ]; then break;
 	elif [ "${!n}" == "--filter" ]; then
 		filter="${!m}"
+		let "n++"
+	elif [ "${!n}" == "--threads" ]; then
+		let "threads=${!m}+1"
 		let "n++"
 	elif [ "${!n}" == "--rename" ]; then rename=1
 	elif [ "${!n}" == "--capture-only" ]; then
@@ -387,7 +389,7 @@ plinks=""; # prev links for comparing
 let "num=0,nhtml=0,nerror=0,nok=0"
 for (( t=$START;t<=$END;t+=$STEP )); do
 	currenturl=$(echo $url | sed "s/$flag/$t/g")
-	printf "## capturing $currenturl "
+	printf "\n## capturing $currenturl \n"
 	echo \"$0\" $args | sed "s/--order \([0-9]*\)/--order $t/g" > .resume
 	if [ "$follow" == "1" ]; then
 		if [ "$cookie" != "" ]; then
